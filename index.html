@@ -1,0 +1,174 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"></head><body>
+<title>Viggo Parrot</title>
+<style>
+:root{--bg:#fff8ec;--fg:#2b2118;--muted:#7a6a5a;--accent:#ff7a29;--accent2:#2bb673;--card:#fff;--line:#eadfce}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1d1814;--fg:#f6ede2;--muted:#b3a291;--accent:#ff8a3d;--accent2:#3fd18b;--card:#29221c;--line:#3d332a}}
+:root[data-theme="dark"]{--bg:#1d1814;--fg:#f6ede2;--muted:#b3a291;--accent:#ff8a3d;--accent2:#3fd18b;--card:#29221c;--line:#3d332a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,sans-serif;-webkit-user-select:none;user-select:none}
+main{max-width:520px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:4px 0 12px;text-align:center}
+#big{display:block;width:220px;height:220px;margin:8px auto 12px;border-radius:50%;border:0;font-size:84px;background:var(--card);box-shadow:0 0 0 8px var(--line);transition:box-shadow .08s,transform .15s;cursor:pointer}
+#big.listening{box-shadow:0 0 0 8px var(--accent2)}
+#big.recording{box-shadow:0 0 0 14px #e8443a}
+#big.playing{box-shadow:0 0 0 14px var(--accent);transform:scale(1.06)}
+#state{text-align:center;font-size:20px;font-weight:600;min-height:28px}
+#meter{height:12px;background:var(--line);border-radius:6px;overflow:hidden;margin:12px 0 4px;position:relative}
+#lvl{height:100%;width:0;background:var(--accent2)}
+#thr{position:absolute;top:-2px;bottom:-2px;width:3px;background:#e8443a}
+label{display:block;margin:14px 0 2px;color:var(--muted);font-size:14px}
+input[type=range]{width:100%}
+.row{display:flex;gap:8px;margin-top:16px}
+button.b{flex:1;padding:14px;border-radius:12px;border:0;font-size:16px;font-weight:600;background:var(--accent);color:#fff}
+button.b.sec{background:var(--card);color:var(--fg);border:1px solid var(--line)}
+button.b:disabled{opacity:.4}
+#clips{list-style:none;padding:0;margin:12px 0}
+#clips li{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line)}
+#clips li button{border:0;background:var(--card);border-radius:8px;padding:6px 10px;font-size:16px;color:var(--fg)}
+#clips li span{flex:1}
+#err{color:#e8443a;text-align:center;margin-top:8px}
+.hint{color:var(--muted);font-size:13px;text-align:center}
+</style>
+<main>
+<h1>🦜 Viggo Parrot</h1>
+<button id="big" aria-label="Start">▶️</button>
+<div id="state">Tap to start</div>
+<div id="err"></div>
+<div id="meter"><div id="lvl"></div><div id="thr"></div></div>
+<div class="hint">Green bar = sound level. Red line = how loud it must be to start recording.</div>
+<label>Sensitivity <b id="sensV"></b></label>
+<input id="sens" type="range" min="0" max="100" value="55">
+<label>Parrot speed <b id="spdV"></b></label>
+<input id="spd" type="range" min="100" max="200" value="150" step="5">
+<label>Silence before parroting <b id="silV"></b></label>
+<input id="sil" type="range" min="400" max="2500" value="1000" step="100">
+<div class="row">
+<button class="b" id="dl" disabled>⬇️ Download all</button>
+<button class="b sec" id="clear" disabled>Clear</button>
+</div>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="fast"> Download sped-up version instead of normal speed</label>
+<ul id="clips"></ul>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let ctx,stream,proc,src,running=false,mode='idle';
+let clips=[];            // {data:Float32Array, rate}
+let pre=[],preLen=0,cur=[],curLen=0,silentMs=0,loudMs=0,cooldownUntil=0,wakeLock=null;
+const PRE_MS=350,MIN_MS=350,MAX_MS=20000;
+
+function thr(){const v=+$('sens').value;return Math.pow(10,-1-(v/100)*2.2)} // 0.1 .. ~0.0006
+function speed(){return +$('spd').value/100}
+function silence(){return +$('sil').value}
+function upd(){$('sensV').textContent=$('sens').value+'%';$('spdV').textContent=speed().toFixed(2)+'×';$('silV').textContent=(silence()/1000).toFixed(1)+' s';
+ $('thr').style.left=Math.min(100,Math.sqrt(thr()/0.25)*100)+'%'}
+['sens','spd','sil'].forEach(i=>$(i).oninput=upd);upd();
+
+function setMode(m,txt){mode=m;$('big').className=m;$('state').textContent=txt;
+ $('big').textContent={idle:'▶️',listening:'👂',recording:'🔴',playing:'🦜'}[m]}
+
+async function start(){
+ $('err').textContent='';
+ try{
+  ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();
+  await ctx.resume();
+  // unlock iOS output with a silent blip
+  const b=ctx.createBuffer(1,1,ctx.sampleRate),s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);s.start();
+  stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:false,autoGainControl:true}});
+ }catch(e){$('err').textContent='Could not use the microphone: '+(e.message||e.name)+'. Allow microphone access and try again.';return}
+ src=ctx.createMediaStreamSource(stream);
+ proc=ctx.createScriptProcessor(2048,1,1);
+ proc.onaudioprocess=onAudio;
+ src.connect(proc);proc.connect(ctx.destination);
+ running=true;pre=[];preLen=0;
+ try{wakeLock=await navigator.wakeLock?.request('screen')}catch(e){}
+ setMode('listening','Listening… say something!');
+}
+function stop(){
+ running=false;
+ try{proc.disconnect();src.disconnect();stream.getTracks().forEach(t=>t.stop())}catch(e){}
+ try{wakeLock&&wakeLock.release()}catch(e){}
+ if(playingSrc){try{playingSrc.stop()}catch(e){}}
+ setMode('idle','Stopped. Tap to start again');
+}
+$('big').onclick=()=>running?stop():start();
+
+function onAudio(e){
+ const inp=e.inputBuffer.getChannelData(0);
+ let sum=0;for(let i=0;i<inp.length;i++)sum+=inp[i]*inp[i];
+ const rms=Math.sqrt(sum/inp.length);
+ $('lvl').style.width=Math.min(100,Math.sqrt(rms/0.25)*100)+'%';
+ if(!running||mode==='playing'||ctx.currentTime<cooldownUntil)return;
+ const chunk=new Float32Array(inp);const ms=chunk.length/ctx.sampleRate*1000;
+ const loud=rms>thr();
+ if(mode==='listening'){
+  pre.push(chunk);preLen+=ms;while(preLen>PRE_MS&&pre.length>1){preLen-=pre[0].length/ctx.sampleRate*1000;pre.shift()}
+  if(loud){cur=pre.slice();curLen=preLen;pre=[];preLen=0;silentMs=0;loudMs=ms;setMode('recording','Recording…')}
+ }else if(mode==='recording'){
+  cur.push(chunk);curLen+=ms;
+  if(loud){silentMs=0;loudMs+=ms}else silentMs+=ms;
+  if(silentMs>=silence()||curLen>=MAX_MS)finishClip();
+ }
+}
+function finishClip(){
+ // drop most of the trailing silence, keep 250ms tail
+ const rate=ctx.sampleRate;let keepMs=curLen-Math.max(0,silentMs-250);
+ let n=Math.floor(keepMs/1000*rate),total=0;cur.forEach(c=>total+=c.length);n=Math.min(n,total);
+ const data=new Float32Array(n);let o=0;for(const c of cur){if(o>=n)break;const k=Math.min(c.length,n-o);data.set(c.subarray(0,k),o);o+=k}
+ cur=[];curLen=0;
+ if(loudMs<MIN_MS*0.5||n<rate*MIN_MS/1000){setMode('listening','Listening… say something!');return}
+ clips.push({data,rate});renderClips();play(data,rate,true);
+}
+let playingSrc=null;
+function play(data,rate,resume){
+ const buf=ctx.createBuffer(1,data.length,rate);buf.getChannelData(0).set(data);
+ const s=ctx.createBufferSource();s.buffer=buf;s.playbackRate.value=speed();
+ const g=ctx.createGain();g.gain.value=1.6;s.connect(g);g.connect(ctx.destination);
+ playingSrc=s;
+ if(resume)setMode('playing','🦜 Parrot talking!');
+ s.onended=()=>{playingSrc=null;if(resume&&running){pre=[];preLen=0;cooldownUntil=ctx.currentTime+0.35;setMode('listening','Listening… say something!')}};
+ s.start();
+}
+function renderClips(){
+ const ul=$('clips');ul.innerHTML='';
+ clips.forEach((c,i)=>{const li=document.createElement('li');
+  const sp=document.createElement('span');sp.textContent='Clip '+(i+1)+' · '+(c.data.length/c.rate).toFixed(1)+' s';
+  const p=document.createElement('button');p.textContent='▶️';p.onclick=async()=>{ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();if(mode!=='playing')play(c.data,c.rate,false)};
+  const d=document.createElement('button');d.textContent='🗑';d.onclick=()=>{clips.splice(i,1);renderClips()};
+  li.append(sp,p,d);ul.prepend(li)});
+ $('dl').disabled=$('clear').disabled=!clips.length;
+}
+$('clear').onclick=()=>{if(confirm('Delete all '+clips.length+' clips?')){clips=[];renderClips()}};
+
+function resample(d,factor){ // speed-up by simple linear interpolation
+ const n=Math.floor(d.length/factor),o=new Float32Array(n);
+ for(let i=0;i<n;i++){const x=i*factor,j=Math.floor(x),f=x-j;o[i]=(d[j]||0)*(1-f)+(d[j+1]||0)*f}return o}
+function wav(){
+ const rate=clips[0].rate,gap=Math.floor(rate*0.4),fast=$('fast').checked;
+ const parts=clips.map(c=>fast?resample(c.data,speed()):c.data);
+ let n=0;parts.forEach(p=>n+=p.length+gap);
+ const buf=new ArrayBuffer(44+n*2),v=new DataView(buf);
+ const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};
+ w(0,'RIFF');v.setUint32(4,36+n*2,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+ v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*2,true);
+ let o=44;for(const p of parts){for(let i=0;i<p.length;i++){const s=Math.max(-1,Math.min(1,p[i]));v.setInt16(o,s<0?s*0x8000:s*0x7fff,true);o+=2}o+=gap*2}
+ return new Blob([buf],{type:'audio/wav'});
+}
+function crc32(u){let c,t=crc32.t;if(!t){t=crc32.t=new Uint32Array(256);for(let n=0;n<256;n++){c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}}
+ c=0xFFFFFFFF;for(let i=0;i<u.length;i++)c=t[(c^u[i])&255]^(c>>>8);return(c^0xFFFFFFFF)>>>0}
+async function zip(fname,blob){ // single-file stored zip (downloads only allows .zip, not .wav)
+ const d=new Uint8Array(await blob.arrayBuffer()),nm=new TextEncoder().encode(fname),crc=crc32(d);
+ const lh=new DataView(new ArrayBuffer(30));lh.setUint32(0,0x04034b50,true);lh.setUint16(4,20,true);lh.setUint32(14,crc,true);lh.setUint32(18,d.length,true);lh.setUint32(22,d.length,true);lh.setUint16(26,nm.length,true);
+ const ch=new DataView(new ArrayBuffer(46));ch.setUint32(0,0x02014b50,true);ch.setUint16(4,20,true);ch.setUint16(6,20,true);ch.setUint32(16,crc,true);ch.setUint32(20,d.length,true);ch.setUint32(24,d.length,true);ch.setUint16(28,nm.length,true);
+ const cdOff=30+nm.length+d.length,eo=new DataView(new ArrayBuffer(22));eo.setUint32(0,0x06054b50,true);eo.setUint16(8,1,true);eo.setUint16(10,1,true);eo.setUint32(12,46+nm.length,true);eo.setUint32(16,cdOff,true);
+ return new Blob([lh,nm,d,ch,nm,eo],{type:'application/zip'})}
+let downloads=null;
+(async()=>{try{downloads=await window.claude?.use?.('downloads')}catch(e){}})();
+$('dl').onclick=async()=>{
+ if(!clips.length)return;
+ const blob=wav(),name='viggo-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.wav';
+ if(downloads){try{await downloads.save({filename:name.replace('.wav','.zip'),data:await zip(name,blob)});return}catch(e){if(e&&e.code==='declined')return}}
+ const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();
+};
+</script>
+
+</body></html>
