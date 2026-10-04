@@ -28,6 +28,13 @@ button.b:disabled{opacity:.4}
 #clips li span{flex:1}
 #err{color:#e8443a;text-align:center;margin-top:8px}
 .hint{color:var(--muted);font-size:13px;text-align:center}
+#lockBtn{display:block;width:100%;margin-top:16px;padding:16px;border-radius:12px;border:0;font-size:18px;font-weight:700;background:#6b4cff;color:#fff}
+#lock{position:fixed;inset:0;z-index:99;background:#000;display:none;touch-action:none;-webkit-touch-callout:none}
+#lock.on{display:block}
+#viz{position:absolute;inset:0;width:100%;height:100%}
+#lockFace{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;font-size:120px;pointer-events:none;transition:transform .1s}
+#corner{position:absolute;top:0;right:0;width:90px;height:90px}
+#unlockHint{position:absolute;top:8px;right:10px;color:#fff6;font-size:12px;text-align:right;pointer-events:none}
 </style>
 <main>
 <h1>🦜 Viggo Parrot</h1>
@@ -47,11 +54,14 @@ button.b:disabled{opacity:.4}
 <button class="b sec" id="clear" disabled>Clear</button>
 </div>
 <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="fast"> Download sped-up version instead of normal speed</label>
+<button id="lockBtn">🔒 Child lock</button>
+<div class="hint">To unlock: tap the top-right corner 3 times quickly.</div>
 <ul id="clips"></ul>
+<div id="lock"><canvas id="viz"></canvas><div id="lockFace">👂</div><div id="corner"></div><div id="unlockHint">🔒 tap here ×3</div></div>
 </main>
 <script>
 const $=id=>document.getElementById(id);
-let ctx,stream,proc,src,running=false,mode='idle';
+let ctx,stream,proc,src,analyser,running=false,mode='idle',locked=false;
 let clips=[];            // {data:Float32Array, rate}
 let pre=[],preLen=0,cur=[],curLen=0,silentMs=0,loudMs=0,cooldownUntil=0,wakeLock=null;
 const PRE_MS=350,MIN_MS=350,MAX_MS=20000;
@@ -64,7 +74,7 @@ function upd(){$('sensV').textContent=$('sens').value+'%';$('spdV').textContent=
 ['sens','spd','sil'].forEach(i=>$(i).oninput=upd);upd();
 
 function setMode(m,txt){mode=m;$('big').className=m;$('state').textContent=txt;
- $('big').textContent={idle:'▶️',listening:'👂',recording:'🔴',playing:'🦜'}[m]}
+ $('big').textContent=$('lockFace').textContent={idle:'▶️',listening:'👂',recording:'🗣️',playing:'🦜'}[m]}
 
 async function start(){
  $('err').textContent='';
@@ -79,6 +89,7 @@ async function start(){
  proc=ctx.createScriptProcessor(2048,1,1);
  proc.onaudioprocess=onAudio;
  src.connect(proc);proc.connect(ctx.destination);
+ analyser=analyser||ctx.createAnalyser();analyser.fftSize=1024;analyser.smoothingTimeConstant=0.75;src.connect(analyser);
  running=true;pre=[];preLen=0;
  try{wakeLock=await navigator.wakeLock?.request('screen')}catch(e){}
  setMode('listening','Listening… say something!');
@@ -122,7 +133,7 @@ let playingSrc=null;
 function play(data,rate,resume){
  const buf=ctx.createBuffer(1,data.length,rate);buf.getChannelData(0).set(data);
  const s=ctx.createBufferSource();s.buffer=buf;s.playbackRate.value=speed();
- const g=ctx.createGain();g.gain.value=1.6;s.connect(g);g.connect(ctx.destination);
+ const g=ctx.createGain();g.gain.value=1.6;s.connect(g);g.connect(ctx.destination);if(analyser)g.connect(analyser);
  playingSrc=s;
  if(resume)setMode('playing','🦜 Parrot talking!');
  s.onended=()=>{playingSrc=null;if(resume&&running){pre=[];preLen=0;cooldownUntil=ctx.currentTime+0.35;setMode('listening','Listening… say something!')}};
@@ -169,6 +180,31 @@ $('dl').onclick=async()=>{
  if(downloads){try{await downloads.save({filename:name.replace('.wav','.zip'),data:await zip(name,blob)});return}catch(e){if(e&&e.code==='declined')return}}
  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();
 };
+
+// ---- child lock + visualizer ----
+const lockEl=$('lock'),cv=$('viz'),cx=cv.getContext('2d');let taps=[],hue0=0;
+$('lockBtn').onclick=async()=>{if(!running)await start();if(!running)return;locked=true;lockEl.classList.add('on');
+ try{await (lockEl.requestFullscreen||lockEl.webkitRequestFullscreen||(()=>{})).call(lockEl)}catch(e){}
+ requestAnimationFrame(draw)};
+function unlock(){locked=false;lockEl.classList.remove('on');try{document.fullscreenElement&&document.exitFullscreen()}catch(e){}}
+['touchstart','touchmove','touchend','gesturestart','contextmenu','mousedown','click','dblclick'].forEach(ev=>lockEl.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation()},{passive:false}));
+function cornerTap(e){const t=e.changedTouches?e.changedTouches[0]:e;if(t.clientX<innerWidth-90||t.clientY>90)return;
+ const now=Date.now();taps=taps.filter(x=>now-x<1500);taps.push(now);if(taps.length>=3){taps=[];unlock()}}
+lockEl.addEventListener('touchstart',cornerTap,{passive:false});lockEl.addEventListener('mousedown',cornerTap);
+document.addEventListener('touchmove',e=>{if(locked)e.preventDefault()},{passive:false});
+function draw(){
+ if(!locked)return;requestAnimationFrame(draw);
+ const dpr=devicePixelRatio||1,W=cv.clientWidth*dpr,H=cv.clientHeight*dpr;if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H}
+ cx.fillStyle='rgba(0,0,0,0.25)';cx.fillRect(0,0,W,H);
+ if(!analyser)return;
+ const N=96,d=new Uint8Array(analyser.frequencyBinCount);analyser.getByteFrequencyData(d);
+ hue0=(hue0+(mode==='playing'?3:0.7))%360;
+ const bw=W/N,cy=H/2;let tot=0;
+ for(let i=0;i<N;i++){const k=Math.floor(Math.pow(i/N,1.7)*d.length*0.7);const v=d[k]/255;tot+=v;
+  const h=v*v*H*0.48+4;cx.fillStyle='hsl('+((hue0+i*3.5)%360)+',95%,'+(45+v*25)+'%)';
+  cx.fillRect(i*bw+1,cy-h,bw-2,h*2)}
+ const lvl=tot/N;$('lockFace').style.transform='translateY(-50%) scale('+(1+lvl*1.2)+')';
+}
 </script>
 
 </body></html>
